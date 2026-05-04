@@ -1,422 +1,296 @@
-# Profiles API
+# Intelligence Query Engine (Profiles API)
 
-Production-ready Node.js REST API that accepts a name, enriches it using external services, classifies the result, stores it in SQLite, and exposes CRUD endpoints with filtering.
+Production-ready REST API for profile persistence, structured filtering, and **rule-based natural language search** over the same database layer as Stage 1.
 
-## Tech Stack
+## Requirements
 
-- Node.js + Express
-- Axios (external API calls)
-- Sequelize + SQLite
-- UUID v7 (`uuid` package)
+- Node.js 18+
+- npm
 
-## External APIs Used
-
-- [Genderize](https://api.genderize.io?name=ella)
-- [Agify](https://api.agify.io?name=ella)
-- [Nationalize](https://api.nationalize.io?name=ella)
-
-## Upstream Validation Rules (Strict)
-
-The API enforces strict type/numeric validation on upstream responses before classification and persistence. If any rule fails, the API returns `502` with:
-
-```json
-{
-  "status": "error",
-  "message": "<ExternalApi> returned an invalid response"
-}
-```
-
-Rules:
-
-- `Genderize` must include:
-  - `gender` as `string`
-  - `probability` as `number`
-  - `count` as `number` and `count !== 0`
-- `Agify` must include:
-  - `age` as `number`
-- `Nationalize` must include:
-  - `country` as a non-empty array
-  - at least one country object where:
-    - `country_id` is `string`
-    - `probability` is `number`
-
-Only validated Nationalize countries are used for top-country selection.
-
-## Project Structure
-
-```text
-src/
-  server.js
-  app.js
-  routes/
-    profiles.js
-  controllers/
-    profileController.js
-  services/
-    genderizeService.js
-    agifyService.js
-    nationalizeService.js
-    profileService.js
-  models/
-    profileModel.js
-  database/
-    db.js
-  utils/
-    validator.js
-    classification.js
-    errors.js
-```
-
-## Setup
+## Install & run
 
 ```bash
 npm install
-```
-
-## Run
-
-Development:
-
-```bash
-npm run dev
-```
-
-Production:
-
-```bash
 npm start
 ```
 
-Default base URL:
+Default port: `3000` (override with `PORT`).
 
-```text
-http://localhost:3000
-```
+## Seed data
 
----
+Place your full **2026** profile export at:
 
-## API Reference
+`data/profiles.json` (JSON array of objects).
 
-### 1) POST `/api/profiles`
-
-Creates a profile for a given `name`, unless it already exists (idempotent by unique name).
-
-#### Success (new profile) - `201`
+Then:
 
 ```bash
-curl.exe -i -X POST "http://localhost:3000/api/profiles" ^
-  -H "Content-Type: application/json" ^
-  -d "{\"name\":\"ella\"}"
+npm run seed
 ```
 
-Response:
+The seed script is **idempotent**: it uses `bulkCreate` with `ignoreDuplicates: true` on the unique `name` index, normalizes names to lowercase, validates every required field, and skips invalid rows by exiting with an error (no partial invalid inserts).
+
+## API overview
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/profiles` | Create or return existing profile by `name` (Stage 1 behavior preserved). |
+| `GET` | `/api/profiles/:id` | Fetch one profile by UUID v7 `id`. |
+| `GET` | `/api/profiles` | List profiles with **filters, sort, pagination** (Stage 2). |
+| `GET` | `/api/profiles/search?q=...` | Natural language search → same list response shape (Stage 2). |
+| `DELETE` | `/api/profiles/:id` | Delete profile by `id`. |
+
+### CORS
+
+Responses include:
+
+- `Access-Control-Allow-Origin: *`
+- `Access-Control-Allow-Methods: GET,POST,DELETE,OPTIONS`
+- `Access-Control-Allow-Headers: Content-Type`
+
+`OPTIONS` requests return **204** with no body.
+
+### List: `GET /api/profiles`
+
+**Filters** (combinable with **AND** semantics, all enforced in SQL via Sequelize):
+
+- `gender` — `male` \| `female`
+- `age_group` — `child` \| `teenager` \| `adult` \| `senior`
+- `country_id` — two-letter ISO alpha-2 (e.g. `KE`)
+- `min_age`, `max_age` — integers (invalid pairs such as `min_age` > `max_age` → **400**)
+- `min_gender_probability`, `min_country_probability` — decimals in `[0, 1]`
+
+**Sorting**
+
+- `sort_by` — `age` \| `created_at` \| `gender_probability`
+- `order` — `asc` \| `desc`
+
+Defaults: `sort_by=created_at`, `order=desc`.
+
+**Pagination**
+
+- `page` — integer ≥ `1` (default `1`)
+- `limit` — integer `1`–`50` (default `10`)
+
+**Response shape (strict)**
 
 ```json
 {
   "status": "success",
-  "data": {
-    "id": "018f....",
-    "name": "ella",
-    "gender": "female",
-    "gender_probability": 0.99,
-    "sample_size": 12345,
-    "age": 29,
-    "age_group": "adult",
-    "country_id": "US",
-    "country_probability": 0.45,
-    "created_at": "2026-05-01T15:00:00.000Z"
+  "page": 1,
+  "limit": 10,
+  "total": 123,
+  "data": [ /* Profile instances */ ]
+}
+```
+
+**Validation errors**
+
+- Unknown query parameters → **400** `{ "status": "error", "message": "Invalid query parameters" }`
+- Bad *values* (e.g. `gender=other`, `limit=100`, `min_age` > `max_age`) → **400** with the same message
+- Bad *types* (e.g. `page=abc`, `min_age=12.5`) → **422** with the same message
+
+### Search: `GET /api/profiles/search?q=...`
+
+Optional pagination and sort query keys match the list endpoint (`page`, `limit`, `sort_by`, `order`).
+
+If `q` is missing or blank → **400** with `Invalid query parameters`.
+
+If the natural language string cannot be interpreted → **400**:
+
+```json
+{ "status": "error", "message": "Unable to interpret query" }
+```
+
+On success, the response matches the list endpoint format (`status`, `page`, `limit`, `total`, `data`).
+
+---
+
+## 1. Natural language parsing approach
+
+Parsing is implemented in `src/services/queryParserService.js` using **regular expressions and keyword rules only** (no LLM, no external AI).
+
+### Keywords supported
+
+**Gender**
+
+- `male`, `males` → `gender = male`
+- `female`, `females` → `gender = female`
+- Phrases matching `male` **and** `female` together (e.g. `male and female`, `males and females`), or **`male or female`** / **`female or male`**, set `gender` to `["male", "female"]` (SQL `IN` — both genders in this schema).
+
+**Age (numeric)**
+
+- `above N` → `min_age = N` (regex: `\babove\s+(\d{1,3})\b`)
+- `below N` → `max_age = N` (regex: `\bbelow\s+(\d{1,3})\b`)
+- `between N and M` → `min_age = N`, `max_age = M` (regex: `\bbetween\s+(\d{1,3})\s+and\s+(\d{1,3})\b`)
+  - If `N > M`, the query is rejected as uninterpretable.
+
+**Age groups**
+
+- `child` / `children`
+- `teenager` / `teenagers`
+- `adult` / `adults`
+- `senior` / `seniors` / `senior citizens`
+
+**Special**
+
+- `young` → `min_age = 16`, `max_age = 24` **only when** no explicit numeric age condition (`above`, `below`, `between`) was parsed.
+
+**Country**
+
+- Country names are resolved using `data/iso3166-slim-2.json` plus a small alias table in `src/utils/countryLookup.js`.
+- Matching is **longest-name-first** with ASCII normalization (case folding + stripping diacritics) and non-letter boundaries to reduce false positives.
+
+### How parsing works (pipeline)
+
+1. **Normalize** input: trim, lowercase, collapse whitespace.
+2. **Country**: scan known country names (longest first) in the normalized text; first hit wins → `country_id` (ISO alpha-2).
+3. **Gender (dual)**: if `male or female` / `female or male`, or `male`/`males` **and** `female`/`females` with `and` between → `gender: ["male", "female"]`.
+4. **Else** assign **single gender** from `male`/`males` or `female`/`females` keywords.
+5. **Age group** keywords (mutually overwriting in the order checked: child → teenager → adult → senior).
+6. **Numeric ages**: parse `between` (exclusive with the next branch), else parse `above` and `below` independently (so both can apply).
+7. **`young`**: apply the 16–24 window only if step 6 did not set any numeric age constraint.
+8. If **no** signal was detected from any category, return `Unable to interpret query`.
+
+The parser returns a compact filter object:
+
+```json
+{
+  "gender": "male",
+  "age_group": "adult",
+  "country_id": "KE",
+  "min_age": 17,
+  "max_age": 24
+}
+```
+
+`gender` may be a string (`"male"` / `"female"`) or an array of both when dual phrasing is detected. Only keys that were inferred are present.
+
+---
+
+## 2. Mapping logic (phrases → filters)
+
+| Example query | Parsed filters |
+|---------------|----------------|
+| `young males` | `gender=male`, `min_age=16`, `max_age=24` |
+| `females above 30` | `gender=female`, `min_age=30` |
+| `people from angola` | `country_id=AO` |
+| `adult males from kenya` | `gender=male`, `age_group=adult`, `country_id=KE` |
+| `male and female teenagers above 17` | `gender` = `["male","female"]`, `age_group=teenager`, `min_age=17` |
+
+**End-to-end flow (search)**
+
+`q` → `queryParserService` → filter object → `queryBuilder` (Sequelize `WHERE` / `ORDER` / `LIMIT` / `OFFSET`) → `Profile.findAndCountAll` → HTTP JSON.
+
+The list endpoint uses the **same** query builder; only the *source* of filters differs (query string vs parser).
+
+---
+
+## 3. Limitations
+
+- **Strict vocabulary**: arbitrary English (“folks in their twenties”) is not understood unless it matches the documented keywords/patterns.
+- **Ambiguity**: phrases that mention overlapping regions without a resolvable longest country token may pick an unintended country (mitigated by longest-first matching + boundary checks, but not impossible).
+- **Ambiguous country names** may resolve to the wrong ISO code or not match at all (e.g. “Georgia” as country vs. US state, “America”, short forms of “Congo”, or colloquial names not in the lookup data).
+- **Dual gender** is detected for `male`/`males` **and** `female`/`females` joined with **`and`**, or for **`male or female`** / **`female or male`**. Other phrasing (e.g. “either male or female”) is not supported.
+- **Numeric ages** only accept integer literals in the query text (`above thirty` fails).
+- **SQLite typing**: age comparisons and age sorting use `CAST(age AS INTEGER)` in SQL so numeric ranges remain correct even if legacy rows stored numeric ages with text affinity.
+
+---
+
+## 4. Examples (real queries → parser output)
+
+Below are **actual** outputs from `parseNaturalLanguageQuery` in this codebase.
+
+### Example A
+
+**Query:** `young males`
+
+**Output:**
+
+```json
+{
+  "status": "success",
+  "filters": {
+    "gender": "male",
+    "min_age": 16,
+    "max_age": 24
   }
 }
 ```
 
-#### Success (already exists) - `200`
+### Example B
 
-Run the same request again:
+**Query:** `females above 30`
 
-```bash
-curl.exe -i -X POST "http://localhost:3000/api/profiles" ^
-  -H "Content-Type: application/json" ^
-  -d "{\"name\":\"ella\"}"
-```
-
-Response:
+**Output:**
 
 ```json
 {
   "status": "success",
-  "message": "Profile already exists",
-  "data": {
-    "id": "018f....",
-    "name": "ella",
+  "filters": {
     "gender": "female",
-    "gender_probability": 0.99,
-    "sample_size": 12345,
-    "age": 29,
-    "age_group": "adult",
-    "country_id": "US",
-    "country_probability": 0.45,
-    "created_at": "2026-05-01T15:00:00.000Z"
+    "min_age": 30
   }
 }
 ```
 
-#### Missing/empty name - `400`
+### Example C
 
-Missing field:
+**Query:** `people from angola`
 
-```bash
-curl.exe -i -X POST "http://localhost:3000/api/profiles" ^
-  -H "Content-Type: application/json" ^
-  -d "{}"
-```
-
-Empty string:
-
-```bash
-curl.exe -i -X POST "http://localhost:3000/api/profiles" ^
-  -H "Content-Type: application/json" ^
-  -d "{\"name\":\"   \"}"
-```
-
-Error format:
-
-```json
-{
-  "status": "error",
-  "message": "name is required"
-}
-```
-
-or
-
-```json
-{
-  "status": "error",
-  "message": "name cannot be empty"
-}
-```
-
-#### Invalid type - `422`
-
-```bash
-curl.exe -i -X POST "http://localhost:3000/api/profiles" ^
-  -H "Content-Type: application/json" ^
-  -d "{\"name\":123}"
-```
-
-Response:
-
-```json
-{
-  "status": "error",
-  "message": "name must be a string"
-}
-```
-
-#### External API invalid response - `502`
-
-Use a synthetic/uncommon name to increase chance of null/empty upstream data:
-
-```bash
-curl.exe -i -X POST "http://localhost:3000/api/profiles" ^
-  -H "Content-Type: application/json" ^
-  -d "{\"name\":\"zzzzzzzzzzzzzzzzzz\"}"
-```
-
-Possible response format (depends on which upstream fails validation):
-
-```json
-{
-  "status": "error",
-  "message": "Genderize returned an invalid response"
-}
-```
-
-or
-
-```json
-{
-  "status": "error",
-  "message": "Agify returned an invalid response"
-}
-```
-
-or
-
-```json
-{
-  "status": "error",
-  "message": "Nationalize returned an invalid response"
-}
-```
-
----
-
-### 2) GET `/api/profiles/:id`
-
-#### Success - `200`
-
-First create a profile and copy its `id`, then:
-
-```bash
-curl.exe -i "http://localhost:3000/api/profiles/<PROFILE_ID>"
-```
-
-Response:
+**Output:**
 
 ```json
 {
   "status": "success",
-  "data": {
-    "id": "018f....",
-    "name": "ella",
-    "gender": "female",
-    "gender_probability": 0.99,
-    "sample_size": 12345,
-    "age": 29,
-    "age_group": "adult",
-    "country_id": "US",
-    "country_probability": 0.45,
-    "created_at": "2026-05-01T15:00:00.000Z"
+  "filters": {
+    "country_id": "AO"
   }
 }
 ```
 
-#### Not found - `404`
+### Example D
 
-```bash
-curl.exe -i "http://localhost:3000/api/profiles/00000000-0000-7000-8000-000000000000"
-```
+**Query:** `adult males from kenya`
 
-Response:
-
-```json
-{
-  "status": "error",
-  "message": "Profile not found"
-}
-```
-
----
-
-### 3) GET `/api/profiles`
-
-Returns all profiles with optional case-insensitive filters:
-
-- `gender`
-- `country_id`
-- `age_group`
-
-#### Success (all) - `200`
-
-```bash
-curl.exe -i "http://localhost:3000/api/profiles"
-```
-
-#### Success (filtered, case-insensitive) - `200`
-
-```bash
-curl.exe -i "http://localhost:3000/api/profiles?gender=FEMALE&country_id=us&age_group=ADULT"
-```
-
-Response shape:
+**Output:**
 
 ```json
 {
   "status": "success",
-  "count": 1,
-  "data": [
-    {
-      "id": "018f....",
-      "name": "ella",
-      "gender": "female",
-      "gender_probability": 0.99,
-      "sample_size": 12345,
-      "age": 29,
-      "age_group": "adult",
-      "country_id": "US",
-      "country_probability": 0.45,
-      "created_at": "2026-05-01T15:00:00.000Z"
-    }
-  ]
+  "filters": {
+    "country_id": "KE",
+    "gender": "male",
+    "age_group": "adult"
+  }
+}
+```
+
+### Example E
+
+**Query:** `male and female teenagers above 17`
+
+**Output:**
+
+```json
+{
+  "status": "success",
+  "filters": {
+    "gender": ["male", "female"],
+    "age_group": "teenager",
+    "min_age": 17
+  }
 }
 ```
 
 ---
 
-### 4) DELETE `/api/profiles/:id`
+## Architecture notes
 
-#### Success - `204`
+- **Query builder**: `src/utils/queryBuilder.js` centralizes Sequelize `WHERE`, `ORDER BY`, pagination (`limit`/`offset`), and `findAndCountAll` counting.
+- **No in-memory filtering** for list/search: all constraints are pushed to the database.
+- **Indexes** (declared on the Sequelize model): unique `name`, plus `gender` and `country_id` non-unique indexes to support common filters.
 
-```bash
-curl.exe -i -X DELETE "http://localhost:3000/api/profiles/<PROFILE_ID>"
-```
+## License
 
-No response body.
-
-#### Not found - `404`
-
-```bash
-curl.exe -i -X DELETE "http://localhost:3000/api/profiles/00000000-0000-7000-8000-000000000000"
-```
-
-Response:
-
-```json
-{
-  "status": "error",
-  "message": "Profile not found"
-}
-```
-
----
-
-## Global 404 (Unknown Route) - `404`
-
-```bash
-curl.exe -i "http://localhost:3000/api/unknown"
-```
-
-Response:
-
-```json
-{
-  "status": "error",
-  "message": "Route not found"
-}
-```
-
-## Internal Error - `500`
-
-The API returns:
-
-```json
-{
-  "status": "error",
-  "message": "Internal server error"
-}
-```
-
-One practical way to simulate a server-side `500` is to force a DB write failure:
-
-1. Stop the API.
-2. Make `profiles.sqlite` read-only.
-3. Start the API.
-4. Call `POST /api/profiles`.
-
-Example request:
-
-```bash
-curl.exe -i -X POST "http://localhost:3000/api/profiles" ^
-  -H "Content-Type: application/json" ^
-  -d "{\"name\":\"force500\"}"
-```
-
----
-
-## Notes
-
-- IDs are UUID v7.
-- `created_at` is generated dynamically in UTC ISO 8601 format.
-- Name uniqueness guarantees idempotent profile creation.
-- CORS header is enabled: `Access-Control-Allow-Origin: *`.
+ISC

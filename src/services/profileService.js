@@ -1,10 +1,12 @@
-const { Op, fn, col, where } = require("sequelize");
+const { where, fn, col } = require("sequelize");
 const { v7: uuidv7 } = require("uuid");
 const Profile = require("../models/profileModel");
 const { fetchGenderize } = require("./genderizeService");
 const { fetchAgify } = require("./agifyService");
 const { fetchNationalize } = require("./nationalizeService");
 const { classifyAgeGroup } = require("../utils/classification");
+const { getCountryNameByIso } = require("../utils/countryLookup");
+const { findProfilesWithFilters } = require("../utils/queryBuilder");
 const { AppError, ExternalApiError } = require("../utils/errors");
 
 const creationLocks = new Map();
@@ -85,16 +87,19 @@ async function createProfile(nameInput) {
       throw new ExternalApiError("Nationalize");
     }
 
+    const countryId = String(topCountry.country_id).toUpperCase();
+    const countryName = getCountryNameByIso(countryId);
+
     try {
       const profile = await Profile.create({
         id: uuidv7(),
         name: normalizedName,
         gender: genderizeData.gender,
         gender_probability: genderizeData.probability,
-        sample_size: genderizeData.count,
         age: agifyData.age,
         age_group: classifyAgeGroup(agifyData.age),
-        country_id: topCountry.country_id,
+        country_id: countryId,
+        country_name: countryName || countryId,
         country_probability: topCountry.probability,
         created_at: new Date().toISOString()
       });
@@ -126,38 +131,22 @@ async function getProfileById(id) {
   return profile;
 }
 
-async function getAllProfiles(filters) {
-  const whereClause = {};
-  const andConditions = [];
+async function listProfiles({ filters, sort_by, order, page, limit }) {
+  const { rows, count } = await findProfilesWithFilters(
+    Profile,
+    filters,
+    sort_by,
+    order,
+    page,
+    limit
+  );
 
-  if (filters.gender) {
-    andConditions.push(
-      where(fn("lower", col("gender")), filters.gender.trim().toLowerCase())
-    );
-  }
-
-  if (filters.country_id) {
-    andConditions.push(
-      where(fn("lower", col("country_id")), filters.country_id.trim().toLowerCase())
-    );
-  }
-
-  if (filters.age_group) {
-    andConditions.push(
-      where(fn("lower", col("age_group")), filters.age_group.trim().toLowerCase())
-    );
-  }
-
-  if (andConditions.length > 0) {
-    whereClause[Op.and] = andConditions;
-  }
-
-  const profiles = await Profile.findAll({
-    where: whereClause,
-    order: [["created_at", "DESC"]]
-  });
-
-  return profiles;
+  return {
+    data: rows,
+    total: count,
+    page,
+    limit
+  };
 }
 
 async function deleteProfileById(id) {
@@ -173,6 +162,6 @@ async function deleteProfileById(id) {
 module.exports = {
   createProfile,
   getProfileById,
-  getAllProfiles,
+  listProfiles,
   deleteProfileById
 };

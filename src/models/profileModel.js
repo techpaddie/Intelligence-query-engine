@@ -22,10 +22,6 @@ const Profile = sequelize.define(
       type: DataTypes.FLOAT,
       allowNull: false
     },
-    sample_size: {
-      type: DataTypes.INTEGER,
-      allowNull: false
-    },
     age: {
       type: DataTypes.INTEGER,
       allowNull: false
@@ -35,6 +31,10 @@ const Profile = sequelize.define(
       allowNull: false
     },
     country_id: {
+      type: DataTypes.STRING(2),
+      allowNull: false
+    },
+    country_name: {
       type: DataTypes.STRING,
       allowNull: false
     },
@@ -49,7 +49,19 @@ const Profile = sequelize.define(
   },
   {
     tableName: "profiles",
-    timestamps: false
+    timestamps: false,
+    indexes: [
+      { unique: true, fields: ["name"] },
+      { fields: ["gender"] },
+      { fields: ["country_id"] }
+    ],
+    hooks: {
+      beforeValidate(profile) {
+        if (profile.name && typeof profile.name === "string") {
+          profile.name = profile.name.trim().toLowerCase();
+        }
+      }
+    }
   }
 );
 
